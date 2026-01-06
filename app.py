@@ -8,17 +8,28 @@ import plotly.graph_objects as go
 # Konfiguracija stranice
 st.set_page_config(page_title="TP Monitor", layout="wide", page_icon="🔥")
 
-# Ime fajla za čuvanje podataka
-DATA_FILE = "toplotna_pumpa_data.csv"
+# --- KONFIGURACIJA PUTANJE ---
+# Određujemo apsolutnu putanju do direktorijuma gde se nalazi ova skripta
+try:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    BASE_DIR = os.getcwd() # Fallback za specifična okruženja
+
+# Fajl će se kreirati u istom folderu kao i skripta
+DATA_FILE = os.path.join(BASE_DIR, "toplotna_pumpa_data.csv")
 
 # --- FUNKCIJE ---
 
 def load_data():
     """Učitava podatke iz CSV fajla."""
     if os.path.exists(DATA_FILE):
-        df = pd.read_csv(DATA_FILE)
-        df['Datum'] = pd.to_datetime(df['Datum'])
-        return df.sort_values(by='Datum')
+        try:
+            df = pd.read_csv(DATA_FILE)
+            df['Datum'] = pd.to_datetime(df['Datum'])
+            return df.sort_values(by='Datum')
+        except Exception as e:
+            st.error(f"Greška pri učitanju fajla: {e}")
+            return pd.DataFrame()
     else:
         return pd.DataFrame(columns=[
             'Datum', 'Brojilo_1_Stanje', 'Brojilo_2_Stanje', 
@@ -28,15 +39,22 @@ def load_data():
 
 def save_data(data):
     """Čuva podatke u CSV fajl."""
-    # Ako fajl ne postoji, upisujemo header, inače samo dodajemo red
-    if not os.path.exists(DATA_FILE):
-        pd.DataFrame([data]).to_csv(DATA_FILE, index=False)
-    else:
-        pd.DataFrame([data]).to_csv(DATA_FILE, mode='a', header=False, index=False)
+    try:
+        if not os.path.exists(DATA_FILE):
+            pd.DataFrame([data]).to_csv(DATA_FILE, index=False)
+        else:
+            pd.DataFrame([data]).to_csv(DATA_FILE, mode='a', header=False, index=False)
+        return True
+    except Exception as e:
+        st.error(f"Greška pri čuvanju: {e}")
+        return False
 
 # --- GLAVNI INTERFEJS ---
 
 st.title("🔥 Praćenje Efikasnosti Toplotne Pumpe")
+
+# Prikaz lokacije baze (za debugging)
+st.sidebar.info(f"📂 Baza podataka se čuva u:\n`{DATA_FILE}`")
 
 # Meni u sidebaru
 menu = st.sidebar.radio("Navigacija", ["Unos Podataka", "Analiza i Grafikoni", "Sirovi Podaci"])
@@ -75,8 +93,8 @@ if menu == "Unos Podataka":
                 'Ciklusi': ciklusi,
                 'LWT_Temp': lwt
             }
-            save_data(new_entry)
-            st.success("Podaci su uspešno sačuvani!")
+            if save_data(new_entry):
+                st.success(f"Podaci su uspešno sačuvani u {DATA_FILE}!")
 
 # ----------------- ANALIZA -----------------
 elif menu == "Analiza i Grafikoni":
@@ -86,6 +104,8 @@ elif menu == "Analiza i Grafikoni":
     
     if df.empty or len(df) < 2:
         st.warning("Potrebno je uneti bar dva unosa (dva dana) da bi se izračunala potrošnja i COP.")
+        if not df.empty:
+            st.write("Trenutni podaci:", df)
     else:
         # --- KALKULACIJE ---
         # Računamo razliku (deltu) u odnosu na prethodni unos
