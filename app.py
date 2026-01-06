@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import os
+from streamlit_gsheets import GSheetsConnection
 from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
@@ -8,82 +8,60 @@ import plotly.graph_objects as go
 # Konfiguracija stranice
 st.set_page_config(page_title="TP Monitor", layout="wide", page_icon="🔥")
 
-# --- KONFIGURACIJA PUTANJE ---
-# Određujemo apsolutnu putanju do direktorijuma gde se nalazi ova skripta
-try:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    BASE_DIR = os.getcwd() # Fallback za specifična okruženja
-
-# Fajl će se kreirati u istom folderu kao i skripta
-DATA_FILE = os.path.join(BASE_DIR, "toplotna_pumpa_data.csv")
-
-# --- FUNKCIJE ---
-
-def load_data():
-    """Učitava podatke iz CSV fajla."""
-    if os.path.exists(DATA_FILE):
-        try:
-            df = pd.read_csv(DATA_FILE)
-            df['Datum'] = pd.to_datetime(df['Datum'])
-            return df.sort_values(by='Datum')
-        except Exception as e:
-            st.error(f"Greška pri učitanju fajla: {e}")
-            return pd.DataFrame()
-    else:
-        return pd.DataFrame(columns=[
-            'Datum', 'Brojilo_1_Stanje', 'Brojilo_2_Stanje', 
-            'Aktivno_Brojilo', 'TP_Proizvedeno_kWh', 
-            'Kompresor_Sati', 'Pumpa_Sati', 'Ciklusi', 'LWT_Temp'
-        ])
-
-def save_data(data):
-    """Čuva podatke u CSV fajl."""
-    try:
-        if not os.path.exists(DATA_FILE):
-            pd.DataFrame([data]).to_csv(DATA_FILE, index=False)
-        else:
-            pd.DataFrame([data]).to_csv(DATA_FILE, mode='a', header=False, index=False)
-        return True
-    except Exception as e:
-        st.error(f"Greška pri čuvanju: {e}")
-        return False
-
-# --- GLAVNI INTERFEJS ---
-
 st.title("🔥 Praćenje Efikasnosti Toplotne Pumpe")
 
-# Prikaz lokacije baze (za debugging)
-st.sidebar.info(f"📂 Baza podataka se čuva u:\n`{DATA_FILE}`")
+# --- POVEZIVANJE SA GOOGLE SHEETS ---
+# Konektor koristi podatke iz .streamlit/secrets.toml ili Streamlit Cloud Secrets
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Meni u sidebaru
+def load_data():
+    try:
+        # Čitamo podatke (ttl="0" osigurava da nema keširanja, uvek sveži podaci)
+        df = conn.read(ttl="0")
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Konverzija tipova podataka
+        df['Datum'] = pd.to_datetime(df['Datum'])
+        numeric_cols = [
+            'Brojilo_1_Stanje', 'Brojilo_2_Stanje', 'TP_Proizvedeno_kWh', 
+            'Kompresor_Sati', 'Pumpa_Sati', 'Ciklusi', 'LWT_Temp'
+        ]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+        return df.sort_values(by='Datum')
+    except Exception as e:
+        st.error(f"Greška pri čitanju Sheets-a: {e}")
+        return pd.DataFrame()
+
+# --- GLAVNI INTERFEJS ---
 menu = st.sidebar.radio("Navigacija", ["Unos Podataka", "Analiza i Grafikoni", "Sirovi Podaci"])
 
-# ----------------- UNOS PODATAKA -----------------
 if menu == "Unos Podataka":
     st.header("📝 Unos novog stanja")
+    df_existing = load_data()
     
     with st.form("entry_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
-        
         with col1:
             datum = st.date_input("Datum očitavanja", datetime.now())
             brojilo_1 = st.number_input("Stanje Brojila 1 (kWh)", min_value=0.0, format="%.2f")
             brojilo_2 = st.number_input("Stanje Brojila 2 (kWh)", min_value=0.0, format="%.2f")
             aktivno = st.selectbox("Koje brojilo trenutno meri TP?", ["Brojilo 1", "Brojilo 2"])
-            
         with col2:
             tp_proizvedeno = st.number_input("TP Proizvedena energija (Thermal kWh)", min_value=0.0, format="%.1f")
-            lwt = st.number_input("LWT (Izlazna temp vode) °C", min_value=0.0, max_value=80.0, format="%.1f")
+            lwt = st.number_input("LWT °C", min_value=0.0, max_value=80.0, format="%.1f")
             kompresor_h = st.number_input("Rad kompresora (sati)", min_value=0, step=1)
             pumpa_h = st.number_input("Rad cirkulacione pumpe (sati)", min_value=0, step=1)
-            ciklusi = st.number_input("Broj ciklusa kompresora", min_value=0, step=1)
+            ciklusi = st.number_input("Broj ciklusa", min_value=0, step=1)
 
-        submitted = st.form_submit_button("💾 Sačuvaj Podatke")
+        submitted = st.form_submit_button("💾 Sačuvaj u Google Sheets")
         
         if submitted:
-            new_entry = {
-                'Datum': datum,
+            new_row = pd.DataFrame([{
+                'Datum': datum.strftime('%Y-%m-%d'),
                 'Brojilo_1_Stanje': brojilo_1,
                 'Brojilo_2_Stanje': brojilo_2,
                 'Aktivno_Brojilo': aktivno,
@@ -92,104 +70,66 @@ if menu == "Unos Podataka":
                 'Pumpa_Sati': pumpa_h,
                 'Ciklusi': ciklusi,
                 'LWT_Temp': lwt
-            }
-            if save_data(new_entry):
-                st.success(f"Podaci su uspešno sačuvani u {DATA_FILE}!")
+            }])
+            
+            # Spajanje sa postojećim podacima
+            if not df_existing.empty:
+                df_updated = pd.concat([df_existing, new_row], ignore_index=True)
+            else:
+                df_updated = new_row
+                
+            # Slanje nazad u Google Sheets
+            conn.update(data=df_updated)
+            st.success("Podaci su uspešno upisani u Google Sheets!")
+            st.balloons()
 
-# ----------------- ANALIZA -----------------
 elif menu == "Analiza i Grafikoni":
     st.header("📊 Analiza Sezone Grejanja")
-    
     df = load_data()
     
     if df.empty or len(df) < 2:
-        st.warning("Potrebno je uneti bar dva unosa (dva dana) da bi se izračunala potrošnja i COP.")
-        if not df.empty:
-            st.write("Trenutni podaci:", df)
+        st.warning("Potrebno je uneti bar dva očitavanja u Google Sheets za analizu.")
     else:
-        # --- KALKULACIJE ---
-        # Računamo razliku (deltu) u odnosu na prethodni unos
-        df['Delta_Dana'] = df['Datum'].diff().dt.days
+        # Kalkulacije razlika
+        df['Delta_Dana'] = df['Datum'].diff().dt.total_seconds() / (24 * 3600)
         df['Potrosnja_B1'] = df['Brojilo_1_Stanje'].diff()
         df['Potrosnja_B2'] = df['Brojilo_2_Stanje'].diff()
         df['Proizvedeno_Delta'] = df['TP_Proizvedeno_kWh'].diff()
         
-        # Logika za aktivno brojilo: Uzimamo potrošnju onog brojila koje je bilo aktivno
-        # (Pojednostavljeno: uzimamo ono koje je označeno u trenutnom redu)
         df['Potrosnja_Ukupna'] = df.apply(
             lambda x: x['Potrosnja_B1'] if x['Aktivno_Brojilo'] == 'Brojilo 1' else x['Potrosnja_B2'], axis=1
         )
         
-        # Filtriramo prvi red jer je on NaN nakon diff-a
         df_clean = df.dropna(subset=['Potrosnja_Ukupna', 'Proizvedeno_Delta'])
         
-        # --- METRIKE ---
-        st.subheader("Pregled performansi")
-        
-        # Opcija za "čišćenje" potrošnje domaćinstva
-        # Pošto brojilo meri i kuću, COP će biti manji. Ovde možemo oduzeti procenjenu potrošnju kuće.
-        st.info("💡 Pošto brojilo meri i ostale uređaje, unesite procenu dnevne potrošnje kuće (bez TP) za precizniji COP.")
-        fiksna_potrosnja_kuce = st.slider("Procenjena potrošnja kuće (kWh/dan)", 0, 20, 8)
-        
-        df_clean['Potrosnja_Samo_TP'] = df_clean['Potrosnja_Ukupna'] - (fiksna_potrosnja_kuce * df_clean['Delta_Dana'])
-        # Zaštita od negativnih brojeva
-        df_clean['Potrosnja_Samo_TP'] = df_clean['Potrosnja_Samo_TP'].clip(lower=0.1) 
-        
+        # Metrike
+        fiksna_potrosnja_kuce = st.slider("Dnevna potrošnja kuće bez TP (kWh/dan)", 0.0, 30.0, 10.0, step=0.5)
+        df_clean['Potrosnja_Samo_TP'] = (df_clean['Potrosnja_Ukupna'] - (fiksna_potrosnja_kuce * df_clean['Delta_Dana'])).clip(lower=0.5)
         df_clean['COP'] = df_clean['Proizvedeno_Delta'] / df_clean['Potrosnja_Samo_TP']
         
-        # Prikaz KPI kartica (prosek zadnjih 7 unosa ili sve)
-        avg_cop = df_clean['COP'].mean()
-        total_heat = df_clean['Proizvedeno_Delta'].sum()
-        total_elec = df_clean['Potrosnja_Ukupna'].sum()
-        
-        kpi1, kpi2, kpi3 = st.columns(3)
-        kpi1.metric("Prosečan COP (procenjen)", f"{avg_cop:.2f}")
-        kpi2.metric("Ukupno Proizvedeno (Toplota)", f"{total_heat:.0f} kWh")
-        kpi3.metric("Ukupno Potrošeno (Struja)", f"{total_elec:.0f} kWh")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Prosečan COP", f"{df_clean['COP'].mean():.2f}")
+        c2.metric("Ukupna Toplota", f"{df_clean['Proizvedeno_Delta'].sum():.0f} kWh")
+        c3.metric("Ukupna Struja", f"{df_clean['Potrosnja_Ukupna'].sum():.0f} kWh")
 
-        # --- GRAFIKONI ---
-        
-        tab1, tab2, tab3 = st.tabs(["COP & Efikasnost", "Temperature & Ciklusi", "Sati Rada"])
-        
+        # Grafikoni
+        tab1, tab2 = st.tabs(["Efikasnost", "Parametri Rada"])
         with tab1:
-            st.markdown("### Odnos Potrošene i Proizvedene Energije")
-            fig_energy = go.Figure()
-            fig_energy.add_trace(go.Bar(x=df_clean['Datum'], y=df_clean['Potrosnja_Ukupna'], name='Potrošnja Struje (Ukupno)'))
-            fig_energy.add_trace(go.Bar(x=df_clean['Datum'], y=df_clean['Proizvedeno_Delta'], name='Proizvedena Toplota'))
-            st.plotly_chart(fig_energy, use_container_width=True)
+            fig_en = px.area(df_clean, x='Datum', y=['Proizvedeno_Delta', 'Potrosnja_Ukupna'], 
+                             title="Proizvedena vs Potrošena Energija", barmode='overlay')
+            st.plotly_chart(fig_en, use_container_width=True)
             
-            st.markdown("### Trend COP-a")
-            fig_cop = px.line(df_clean, x='Datum', y='COP', markers=True, title="Coefficient of Performance (Dnevni)")
-            # Dodaj liniju za COP = 3 (referenca)
-            fig_cop.add_hline(y=3, line_dash="dash", line_color="green", annotation_text="Dobar COP (3.0)")
+            fig_cop = px.line(df_clean, x='Datum', y='COP', markers=True, title="Trend COP-a")
+            fig_cop.add_hline(y=3, line_dash="dash", line_color="green")
             st.plotly_chart(fig_cop, use_container_width=True)
-
-        with tab2:
-            st.markdown("### Izlazna Temperatura (LWT) vs Ciklusi")
-            fig_temp = px.scatter(df_clean, x='LWT_Temp', y='Ciklusi', color='COP', size='Potrosnja_Ukupna', 
-                                title="Zavisnost Ciklusa od Temperature (Boja = COP)")
-            st.plotly_chart(fig_temp, use_container_width=True)
-
-        with tab3:
-            st.markdown("### Rad Kompresora i Pumpe")
-            # Ovde nam trebaju delte sati rada, ne ukupni
-            df_clean['Kompresor_Delta'] = df['Kompresor_Sati'].diff()
-            df_clean['Pumpa_Delta'] = df['Pumpa_Sati'].diff()
             
-            fig_hours = go.Figure()
-            fig_hours.add_trace(go.Scatter(x=df_clean['Datum'], y=df_clean['Kompresor_Delta'], mode='lines+markers', name='Sati Kompresora'))
-            fig_hours.add_trace(go.Scatter(x=df_clean['Datum'], y=df_clean['Pumpa_Delta'], mode='lines+markers', name='Sati Pumpe'))
-            st.plotly_chart(fig_hours, use_container_width=True)
+        with tab2:
+            df_clean['Kompresor_D'] = df['Kompresor_Sati'].diff()
+            st.plotly_chart(px.bar(df_clean, x='Datum', y='Kompresor_D', title="Sati rada kompresora po periodu"), use_container_width=True)
 
-# ----------------- SIROVI PODACI -----------------
 elif menu == "Sirovi Podaci":
-    st.header("🗃️ Pregled Baze Podataka")
+    st.header("🗃️ Podaci iz Google Sheets-a")
     df = load_data()
     st.dataframe(df)
-    
-    st.download_button(
-        label="Preuzmi CSV",
-        data=df.to_csv(index=False).encode('utf-8'),
-        file_name='toplotna_pumpa_export.csv',
-        mime='text/csv',
-    )
+    if not df.empty:
+        st.download_button("Preuzmi CSV", df.to_csv(index=False), "tp_export.csv")
